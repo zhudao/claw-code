@@ -6428,3 +6428,94 @@ Original filing (2026-04-18): the session emitted `SessionStart hook (completed)
 
 
 450. **`prompt` emits `kind:"missing_credentials"` JSON on STDERR (not stdout), leaving stdout at 0 bytes — automation pattern `output=$(claw prompt hello --output-format json)` captures nothing on auth-absent failure; `doctor` correctly surfaces `auth.status:"warn"` with `api_key_present:false` but exposes no `prompt_ready:false` field that automation can check before invoking `prompt`** — dogfooded 2026-05-16 by Jobdori on `a35ee9a0` in response to Clawhip pinpoint nudge at `1505208225321062521`. Exact reproduction (isolated env, no creds, fresh git repo, HEAD `a35ee9a0`): `timeout 5 env -i HOME=$ISOLATED_HOME PATH=$PATH CLAW_CONFIG_HOME=$PROBE/.claw-cfg claw prompt hello --output-format json > stdout.txt 2> stderr.txt` → stdout = **0 bytes**, stderr = 195 bytes containing `{"error":"missing Anthropic credentials…","exit_code":1,"hint":null,"kind":"missing_credentials","type":"error"}`, exit code 1. Confirms Gaebal's `1505208553793781792` pinpoint that `prompt` timeout + zero bytes was the prior state — HEAD `a35ee9a0` now correctly exits 1 with `kind:"missing_credentials"` **but the envelope is still routed to stderr** (issue #447 class, same class as prior entries #422, #435). **Contrast with `doctor`:** `claw doctor --output-format json 2>/dev/null` succeeds to stdout with `checks[auth].status:"warn"`, `api_key_present:false`, `auth_token_present:false` — but the auth check has no `prompt_ready:false` field. Automation that gates on `doctor` before invoking `prompt` must re-derive readiness from `api_key_present && auth_token_present` — there is no single canonical boolean. **Three compound problems:** (a) **stdout-empty on `--output-format json` failure**: same class as #447; `prompt`'s error envelope goes to stderr, not stdout. The canonical automation idiom `if ! result=$(claw prompt "q" --output-format json); then echo "$result" | jq .kind; fi` sees `$result=""` on failure — the jq call gets nothing. All `--output-format json` error paths must route JSON to stdout per #447 contract; (b) **`doctor` missing `prompt_ready` field**: `doctor --output-format json` already knows auth is absent (`api_key_present:false`) but surfaces no derived `prompt_ready:bool` or `prompt_blocked_reason:string` field. Automation must infer readiness from `api_key_present || auth_token_present || legacy_*_present` — a 5-field OR across legacy fields that is fragile as auth mechanisms evolve. A single `prompt_ready:false` (with `prompt_blocked_reason:"auth_missing"`) inside the `auth` check would give downstream a stable contract; (c) **`claw prompt` with no auth does no preflight and fires straight at the API**: the preflight check that `doctor` runs (auth discovery) is not reused by `prompt` to emit a fast typed error before attempting the network call. Both Gaebal's pinpoint (prompt hanging silently on older HEAD) and the current behavior (prompt hitting auth gate after a brief API attempt) stem from the same root: prompt does not short-circuit at the point where `doctor` already knows auth is absent. If `doctor` can emit `kind:"doctor"` with `auth.status:"warn"` in ~20ms without a network call, `prompt` should emit `kind:"missing_credentials"` in the same window and output it to stdout. **Required fix shape:** (a) `prompt --output-format json` must write the `kind:"missing_credentials"` JSON envelope to **stdout**, not stderr — same fix as #447 for all error envelopes; (b) add `prompt_ready:bool` and `prompt_blocked_reason:string|null` to the `auth` check in `doctor --output-format json`; derive it as `api_key_present || auth_token_present || legacy_saved_oauth_present`; (c) `prompt` must run the credential preflight check (same codepath as doctor's auth check) before attempting any API call and emit `{"kind":"missing_credentials","prompt_blocked_reason":"auth_missing"}` on **stdout** with exit 1 if the check fails; (d) `--output-format json` stdout routing fix must cover: `prompt`, `session list` (cross-ref #449), `skills uninstall` (cross-ref #431), `resume` (cross-ref #435), `acp serve` (cross-ref #443) — the full `kind:"missing_credentials"` class; (e) regression test: `claw prompt hello --output-format json` with no creds writes JSON to stdout (0 bytes stderr), exits 1, `kind:"missing_credentials"`, in under 200ms (no network attempt). **Why this matters:** `prompt` is the primary consumer entry point. Auth-absent failure routing to stderr breaks every automation wrapper that captures `$(claw prompt ... --output-format json)`. The `doctor` preflight metadata gap means auth-readiness checks require parsing 5 legacy fields instead of reading one boolean. Cross-references #447 (all JSON error envelopes on stderr), #449 (session list hits auth gate), #431 (skills uninstall hits auth gate), #357 (auth gate on local ops cluster), #422 (exit-code parity). Source: Jobdori live dogfood, `a35ee9a0`, 2026-05-16.
+
+465. **`claw doctor` / `claw status` auth diagnostics report only `api_key_present` and `auth_token_present` booleans, but omit the *effective auth source* / header behavior when BOTH `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are set. The runtime resolves this state to `AuthSource::ApiKeyAndBearer` and sends both `x-api-key` and `Authorization: Bearer`, while the health surface simply says `status: ok` / `supported auth env vars are configured` with no `effective_auth_source`, no `headers_sent`, no precedence warning, and no “both configured” diagnostic. This reopens the exact auth-intent ambiguity #28 fixed for single-wrong-env cases, but in the mixed-env case where the request path is now different and the doctor surface is silent** — dogfooded 2026-05-24 across the 15:00–16:30 Clawhip nudge window (finalized for message `1508145078760378418`), reproduced on local `./rust/target/debug/claw` `git_sha 003b739d` (origin/main `f8e1bb72`) in a clean isolated env.
+
+    Reproduction:
+
+    ```bash
+    $ env -i HOME=/tmp/iso23/home \
+        ANTHROPIC_API_KEY=sk-ant-fake-apikey-BOTH \
+        ANTHROPIC_AUTH_TOKEN=oauth-fake-bearer-BOTH \
+        PATH=/usr/bin:/bin TERM=dumb \
+        claw doctor --output-format json | jq '.checks[] | select(.name=="auth")'
+    {
+      "api_key_present": true,
+      "auth_token_present": true,
+      "details": [
+        "Environment       api_key=present auth_token=present"
+      ],
+      "legacy_refresh_token_present": false,
+      "legacy_saved_oauth_expires_at": null,
+      "legacy_saved_oauth_present": false,
+      "legacy_scopes": [],
+      "name": "auth",
+      "status": "ok",
+      "summary": "supported auth env vars are configured"
+    }
+    ```
+
+    Text mode says the same thing:
+
+    ```
+    Auth
+      Status           ok
+      Summary          supported auth env vars are configured
+      Details
+        - Environment       api_key=present auth_token=present
+    ```
+
+    No field answers the operational question: **what auth mode will the actual request use?** The answer exists in runtime code but is not surfaced.
+
+    **Root cause traced:** `rust/crates/api/src/providers/anthropic.rs:656-666`:
+
+    ```rust
+    pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
+    where
+        F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
+    {
+        let _ = load_oauth_config;
+        if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
+            return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+                Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
+                    api_key,
+                    bearer_token,
+                }),
+                None => Ok(AuthSource::ApiKey(api_key)),
+            };
+        }
+        if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+            return Ok(AuthSource::BearerToken(bearer_token));
+        }
+        Err(anthropic_missing_credentials())
+    }
+    ```
+
+    And `anthropic.rs:952-954` documents the wire behavior in the 401 hint logic:
+
+    ```rust
+    // Only append the hint when the AuthSource is pure BearerToken. If both
+    // api_key and bearer_token are present (`ApiKeyAndBearer`), the x-api-key
+    // header is already being sent alongside the Bearer header ...
+    ```
+
+    So the actual effective runtime state is **not** merely “two booleans true.” It is a third mode: `ApiKeyAndBearer`, with two headers sent. But `check_auth_health()` in `rust/crates/rusty-claude-cli/src/main.rs:2071-2150` only computes:
+
+    ```rust
+    let api_key_present = env::var("ANTHROPIC_API_KEY").ok().is_some_and(|value| !value.trim().is_empty());
+    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN").ok().is_some_and(|value| !value.trim().is_empty());
+    // ... summary = "supported auth env vars are configured"
+    .with_data(Map::from_iter([
+        ("api_key_present".to_string(), json!(api_key_present)),
+        ("auth_token_present".to_string(), json!(auth_token_present)),
+        ...
+    ]))
+    ```
+
+    It never calls or mirrors `resolve_startup_auth_source`, never emits `effective_auth_source`, and never warns when both mutually-confusing auth knobs are present.
+
+    **Why distinct from existing items:** ROADMAP **#28** fixed single-env-var auth copy: adjacent provider hints, `sk-ant-*` in `ANTHROPIC_AUTH_TOKEN` correction, and docs explaining `x-api-key` vs `Authorization: Bearer`. This pinpoint is the **mixed-env state** after #28: both env vars present, runtime sends both headers, and the doctor/status surface does not tell operators that a combined mode exists. ROADMAP **#37** removed `claw login` / `logout` and told users to set env vars instead; this entry shows the two official env vars can now be set together with no health warning or effective-source disclosure. ROADMAP **#463** covers removed-subcommand envelope kind/hint shape; same auth area but different surface. ROADMAP **#248** asks prompt lifecycle events to include auth source category during non-interactive runs; this entry is the local preflight counterpart: doctor/status should expose auth source before any prompt/API call. **None** of those items record that `doctor` reports “ok” for both official auth vars while hiding the `ApiKeyAndBearer` runtime mode.
+
+    **Why this matters:** (1) **Real users already confuse these two env vars.** #28 was filed because `sk-ant-*` keys in `ANTHROPIC_AUTH_TOKEN` produce bearer-header 401s. The mixed state (`ANTHROPIC_API_KEY` + stale/wrong `ANTHROPIC_AUTH_TOKEN`) is the natural next failure mode after users “try both.” (2) **The request sends both headers.** Whether Anthropic prioritizes `x-api-key`, bearer token, or rejects/confuses the pair is provider behavior; claw should not leave this invisible. (3) **`doctor` is supposed to be preflight truth.** It currently says `ok` and “supported auth env vars are configured,” which sounds healthier than the simpler single-key case, even though the operator may have two conflicting credentials. (4) **Automation cannot decide remediation.** A claw reading booleans cannot know whether to ask the user to unset `ANTHROPIC_AUTH_TOKEN`, unset `ANTHROPIC_API_KEY`, or leave both. A field like `effective_auth_source: "api_key_and_bearer"` plus `headers: ["x-api-key", "authorization_bearer"]` would make that deterministic. (5) **The runtime truth already exists.** `resolve_startup_auth_source` computes the exact enum; the diagnostic layer just reimplements a weaker boolean-only approximation.
+
+    **Required fix shape:** (a) Make `check_auth_health()` call the same auth-source resolver (or a shared redaction-safe helper) used by runtime startup, so diagnostics cannot drift from actual request behavior. (b) Add structured fields to the auth check JSON: `effective_auth_source: "api_key" | "bearer_token" | "api_key_and_bearer" | "none"`, `headers_sent: ["x-api-key", "authorization_bearer"]` (names only, no secrets), and `both_anthropic_auth_env_vars_present: bool`. (c) When both are present, downgrade auth check from `ok` to at least `warn` unless product policy explicitly supports sending both; summary should say `both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set; requests will send both x-api-key and bearer headers` with a hint to unset the stale/wrong one. (d) Mirror these fields into `status --output-format json`, not only `doctor`, because status is the lightweight preflight surface. (e) Add regression coverage for four states: none, API key only, bearer only, both. Assert the “both” state is not boolean-only and carries the combined-mode warning. **Acceptance check:** with both env vars set, `claw doctor --output-format json | jq -e '.checks[] | select(.name=="auth") | .effective_auth_source == "api_key_and_bearer" and (.headers_sent | index("x-api-key") and index("authorization_bearer")) and .status == "warn"'` should pass. Source: gaebal-gajae dogfood for 2026-05-24 15:00–16:30 Clawhip nudges; investigation was interrupted by subsequent nudge ticks, then finalized at 16:30 with code trace and ROADMAP entry. Coordination note: intentionally avoided F/CLAW_CONFIG_HOME because Jobdori publicly queued it as “next confirmed but unfiled”; this auth-precedence surface is orthogonal.

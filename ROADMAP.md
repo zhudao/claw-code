@@ -6428,3 +6428,66 @@ Original filing (2026-04-18): the session emitted `SessionStart hook (completed)
 
 
 450. **`prompt` emits `kind:"missing_credentials"` JSON on STDERR (not stdout), leaving stdout at 0 bytes — automation pattern `output=$(claw prompt hello --output-format json)` captures nothing on auth-absent failure; `doctor` correctly surfaces `auth.status:"warn"` with `api_key_present:false` but exposes no `prompt_ready:false` field that automation can check before invoking `prompt`** — dogfooded 2026-05-16 by Jobdori on `a35ee9a0` in response to Clawhip pinpoint nudge at `1505208225321062521`. Exact reproduction (isolated env, no creds, fresh git repo, HEAD `a35ee9a0`): `timeout 5 env -i HOME=$ISOLATED_HOME PATH=$PATH CLAW_CONFIG_HOME=$PROBE/.claw-cfg claw prompt hello --output-format json > stdout.txt 2> stderr.txt` → stdout = **0 bytes**, stderr = 195 bytes containing `{"error":"missing Anthropic credentials…","exit_code":1,"hint":null,"kind":"missing_credentials","type":"error"}`, exit code 1. Confirms Gaebal's `1505208553793781792` pinpoint that `prompt` timeout + zero bytes was the prior state — HEAD `a35ee9a0` now correctly exits 1 with `kind:"missing_credentials"` **but the envelope is still routed to stderr** (issue #447 class, same class as prior entries #422, #435). **Contrast with `doctor`:** `claw doctor --output-format json 2>/dev/null` succeeds to stdout with `checks[auth].status:"warn"`, `api_key_present:false`, `auth_token_present:false` — but the auth check has no `prompt_ready:false` field. Automation that gates on `doctor` before invoking `prompt` must re-derive readiness from `api_key_present && auth_token_present` — there is no single canonical boolean. **Three compound problems:** (a) **stdout-empty on `--output-format json` failure**: same class as #447; `prompt`'s error envelope goes to stderr, not stdout. The canonical automation idiom `if ! result=$(claw prompt "q" --output-format json); then echo "$result" | jq .kind; fi` sees `$result=""` on failure — the jq call gets nothing. All `--output-format json` error paths must route JSON to stdout per #447 contract; (b) **`doctor` missing `prompt_ready` field**: `doctor --output-format json` already knows auth is absent (`api_key_present:false`) but surfaces no derived `prompt_ready:bool` or `prompt_blocked_reason:string` field. Automation must infer readiness from `api_key_present || auth_token_present || legacy_*_present` — a 5-field OR across legacy fields that is fragile as auth mechanisms evolve. A single `prompt_ready:false` (with `prompt_blocked_reason:"auth_missing"`) inside the `auth` check would give downstream a stable contract; (c) **`claw prompt` with no auth does no preflight and fires straight at the API**: the preflight check that `doctor` runs (auth discovery) is not reused by `prompt` to emit a fast typed error before attempting the network call. Both Gaebal's pinpoint (prompt hanging silently on older HEAD) and the current behavior (prompt hitting auth gate after a brief API attempt) stem from the same root: prompt does not short-circuit at the point where `doctor` already knows auth is absent. If `doctor` can emit `kind:"doctor"` with `auth.status:"warn"` in ~20ms without a network call, `prompt` should emit `kind:"missing_credentials"` in the same window and output it to stdout. **Required fix shape:** (a) `prompt --output-format json` must write the `kind:"missing_credentials"` JSON envelope to **stdout**, not stderr — same fix as #447 for all error envelopes; (b) add `prompt_ready:bool` and `prompt_blocked_reason:string|null` to the `auth` check in `doctor --output-format json`; derive it as `api_key_present || auth_token_present || legacy_saved_oauth_present`; (c) `prompt` must run the credential preflight check (same codepath as doctor's auth check) before attempting any API call and emit `{"kind":"missing_credentials","prompt_blocked_reason":"auth_missing"}` on **stdout** with exit 1 if the check fails; (d) `--output-format json` stdout routing fix must cover: `prompt`, `session list` (cross-ref #449), `skills uninstall` (cross-ref #431), `resume` (cross-ref #435), `acp serve` (cross-ref #443) — the full `kind:"missing_credentials"` class; (e) regression test: `claw prompt hello --output-format json` with no creds writes JSON to stdout (0 bytes stderr), exits 1, `kind:"missing_credentials"`, in under 200ms (no network attempt). **Why this matters:** `prompt` is the primary consumer entry point. Auth-absent failure routing to stderr breaks every automation wrapper that captures `$(claw prompt ... --output-format json)`. The `doctor` preflight metadata gap means auth-readiness checks require parsing 5 legacy fields instead of reading one boolean. Cross-references #447 (all JSON error envelopes on stderr), #449 (session list hits auth gate), #431 (skills uninstall hits auth gate), #357 (auth gate on local ops cluster), #422 (exit-code parity). Source: Jobdori live dogfood, `a35ee9a0`, 2026-05-16.
+
+468. **Repeated global flags silently apply inconsistent merge semantics with no duplicate/provenance signal: `--model` and `--permission-mode` are last-write-wins, `--allowedTools` unions every occurrence, and `--output-format` is last-write-wins even when the first occurrence requested JSON. A wrapper can invoke `claw --output-format json --output-format text status` and receive plain text with exit 0, while `claw --model openai/gpt-4 --model opus status` silently runs Anthropic Opus instead of OpenAI. `status` exposes only the final value (`model_raw`, `permission_mode`, `allowed_tools.entries`) and never reports `duplicate_flags`, `flag_occurrences`, or overwritten values, so automation cannot tell whether a launcher accidentally supplied conflicting global flags** — dogfooded 2026-05-24 for the 18:30–19:00 Clawhip nudge window (finalized for message `1508182831573110904`), reproduced on local `./rust/target/debug/claw` `git_sha 003b739d` (origin/main `f8e1bb72`) in a clean isolated env.
+
+    Reproduction matrix:
+
+    ```bash
+    # Last --model wins silently
+    claw --output-format json --model openai/gpt-4 --model opus status
+    # => {"model":"claude-opus-4-6","model_raw":"opus","model_source":"flag", ...}
+
+    claw --output-format json --model opus --model openai/gpt-4 status
+    # => {"model":"openai/gpt-4","model_raw":"openai/gpt-4","model_source":"flag", ...}
+
+    # Last --output-format wins silently, even overriding machine-readable intent
+    claw --output-format json --output-format text status
+    # => text prose on stdout, exit 0  ❌ no JSON envelope, no warning
+
+    claw --output-format text --output-format json status
+    # => JSON, exit 0
+
+    # Last permission mode wins silently
+    claw --output-format json --permission-mode read-only --permission-mode danger-full-access status
+    # => "permission_mode":"danger-full-access"
+
+    claw --output-format json --permission-mode danger-full-access --permission-mode read-only status
+    # => "permission_mode":"read-only"
+
+    # allowedTools does NOT last-win; it unions occurrences
+    claw --output-format json --allowedTools Bash --allowedTools Read status
+    # => "allowed_tools":{"entries":["bash","read_file"],"restricted":true,"source":"flag"}
+
+    claw --output-format json --allowedTools Read,Bash --allowedTools Edit status
+    # => entries ["bash","edit_file","read_file"]
+    ```
+
+    **Root cause traced:** `rust/crates/rusty-claude-cli/src/main.rs:617-694` has mutable parser state for scalar globals:
+
+    ```rust
+    let mut model = DEFAULT_MODEL.to_string();
+    let mut model_flag_raw: Option<String> = None;
+    let mut output_format = CliOutputFormat::Text;
+    let mut permission_mode_override = None;
+
+    // every occurrence overwrites previous value
+    model = resolve_model_alias_with_config(value);
+    model_flag_raw = Some(value.clone());
+    output_format = CliOutputFormat::parse(value)?;
+    permission_mode_override = Some(parse_permission_mode_arg(value)?);
+    ```
+
+    But `--allowedTools` stores all occurrences in `allowed_tool_values` and normalizes the whole list later (`main.rs:808`):
+
+    ```rust
+    let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+    ```
+
+    So the same parser layer applies two different duplicate semantics: scalar globals overwrite silently; tool allow-list accumulates silently. Neither path emits provenance beyond `source:"flag"`.
+
+    **Why distinct from existing items:** ROADMAP #464 covers invalid `--output-format` values (case/whitespace/Did-you-mean/bootstrap JSON error). This entry covers *valid duplicate* `--output-format` values, especially `json` being overwritten by later `text` with exit 0. ROADMAP #117 covers `-p` greedily swallowing flags into prompt text; this entry covers normal global flags parsed before subcommand. ROADMAP #122 covers `--base-commit` greedily accepting values and swallowing subsequent args; this entry covers duplicate flags that parse successfully. ROADMAP #97 covers `--allowedTools ""` empty allow-set and invisibility; this entry notes `--allowedTools` uses accumulation semantics while adjacent scalar globals use last-wins semantics. ROADMAP #124 covers `--model` accepting unvalidated garbage; this entry uses valid model values and focuses on duplicate/conflict invisibility.
+
+    **Why this matters:** (1) **Automation wrappers commonly append flags.** A user may set `CLAW_ARGS="--output-format json"` and a wrapper may append `--output-format text`; current behavior silently changes the output contract from JSON to text. (2) **Security posture drift:** `--permission-mode read-only --permission-mode danger-full-access` silently escalates to danger-full-access if the unsafe flag appears later. (3) **Provider routing drift:** `--model openai/gpt-4 --model opus` silently flips the selected provider from OpenAI to Anthropic; with #467, doctor/status preflight can then reason about the wrong provider without exposing that an earlier provider flag was overwritten. (4) **Inconsistent semantics are not discoverable.** Why does duplicate `--allowedTools` union but duplicate `--permission-mode` overwrite? Both can be reasonable, but the CLI never states which happened. (5) **No structured provenance.** `status` cannot tell a claw whether a value came from one flag or from conflicting duplicate flags; it only reports the final state.
+
+    **Required fix shape:** (a) Track occurrences for every global flag during parse (`--model`, `--output-format`, `--permission-mode`, `--allowedTools`, `--base-commit`, `--reasoning-effort`, `--max-turns`, etc.) with raw values and argv positions. (b) For scalar flags, either reject duplicates with a structured `duplicate_flag` parse error or allow last-wins but emit `duplicate_flags` / `overwritten_flags` provenance in `status` and `doctor`. For machine-output flags, prefer reject: `--output-format json --output-format text` should not silently break JSON consumers. (c) For `--allowedTools`, document and expose accumulation semantics explicitly (`allowed_tools.source:"flag_accumulated"`, `occurrences:2`) or require comma-list single occurrence. (d) Add JSON/text warnings for duplicate scalar flags in diagnostic subcommands, with redaction-safe values. (e) Regression matrix covering the eight examples above plus valid repeated `--reasoning-effort` / `--base-commit`. **Acceptance check:** `claw --output-format json --output-format text status` should either fail with `kind:"duplicate_flag"` in a JSON error envelope or return JSON containing `duplicate_flags:[{"flag":"--output-format","values":["json","text"],"effective":"text"}]`; current behavior emits plain text and exit 0. Source: gaebal-gajae dogfood for the 2026-05-24 18:30/19:00 Clawhip nudges. Note: an initial repeated-flag probe was contaminated by zsh scalar splitting (whole arg string passed as one token); evidence above was re-run with `eval` and separate stdout/stderr capture before filing.

@@ -310,6 +310,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "unsupported_config_section"
     } else if message.contains("unknown_plugins_action") {
         "unknown_plugins_action"
+    } else if message.contains("is a slash command") || message.starts_with("interactive_only:") {
+        "interactive_only"
     } else {
         "unknown"
     }
@@ -2016,7 +2018,14 @@ impl DiagnosticCheck {
     }
 
     fn json_value(&self) -> Value {
+        // Derive a stable snake_case id from the check name for machine-readable keying (#704).
+        let id = self
+            .name
+            .to_ascii_lowercase()
+            .replace(' ', "_")
+            .replace('-', "_");
         let mut value = Map::from_iter([
+            ("id".to_string(), Value::String(id.clone())),
             (
                 "name".to_string(),
                 Value::String(self.name.to_ascii_lowercase()),
@@ -4101,7 +4110,7 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
-                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.estimate_cost_usd().total_cost_usd(),
                     "pricing": "estimated-default",
                 })),
             })
@@ -4218,17 +4227,31 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(&cwd, action.as_deref(), target.as_deref())?;
             let action_str = action.as_deref().unwrap_or("list");
-            let json = serde_json::json!({
+            let enabled_count = payload
+                .plugins
+                .iter()
+                .filter(|p| p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                .count();
+            let disabled_count = payload.plugins.len().saturating_sub(enabled_count);
+            let mut json = serde_json::json!({
                 "kind": "plugin",
                 "action": action_str,
-                "target": target,
                 "status": payload.status,
+                "summary": {
+                    "total": payload.plugins.len(),
+                    "enabled": enabled_count,
+                    "disabled": disabled_count,
+                    "load_failures": payload.load_failures.len(),
+                },
                 "config_load_error": payload.config_load_error,
-                "message": &payload.message,
-                "reload_runtime": payload.reload_runtime,
                 "plugins": payload.plugins,
                 "load_failures": payload.load_failures,
             });
+            if action_str != "list" {
+                json["target"] = serde_json::json!(target);
+                json["reload_runtime"] = serde_json::json!(payload.reload_runtime);
+                json["message"] = serde_json::json!(&payload.message);
+            }
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(payload.message),
@@ -4255,7 +4278,7 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
-                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.estimate_cost_usd().total_cost_usd(),
                     "pricing": "estimated-default",
                 })),
             })
@@ -5934,20 +5957,36 @@ impl LiveCli {
         let payload = plugins_command_payload_for(&cwd, action, target)?;
         match output_format {
             CliOutputFormat::Text => println!("{}", payload.message),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
+            CliOutputFormat::Json => {
+                let action_str = action.unwrap_or("list");
+                let enabled_count = payload
+                    .plugins
+                    .iter()
+                    .filter(|p| p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .count();
+                let disabled_count = payload.plugins.len().saturating_sub(enabled_count);
+                let mut obj = json!({
                     "kind": "plugin",
-                    "action": action.unwrap_or("list"),
-                    "target": target,
+                    "action": action_str,
                     "status": payload.status,
+                    "summary": {
+                        "total": payload.plugins.len(),
+                        "enabled": enabled_count,
+                        "disabled": disabled_count,
+                        "load_failures": payload.load_failures.len(),
+                    },
                     "config_load_error": payload.config_load_error,
-                    "message": payload.message,
-                    "reload_runtime": payload.reload_runtime,
                     "plugins": payload.plugins,
                     "load_failures": payload.load_failures,
-                }))?
-            ),
+                });
+                // Only include operation-result fields for mutating actions
+                if action_str != "list" {
+                    obj["target"] = json!(target);
+                    obj["reload_runtime"] = json!(payload.reload_runtime);
+                    obj["message"] = json!(payload.message);
+                }
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            }
         }
         Ok(())
     }
@@ -6727,7 +6766,7 @@ fn status_json_value(
             "cumulative_cache_creation_input": usage.cumulative.cache_creation_input_tokens,
             "cumulative_cache_read_input": usage.cumulative.cache_read_input_tokens,
             "cumulative_total": usage.cumulative.total_tokens(),
-            "estimated_cost_usd": format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
+            "estimated_cost_usd": format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.cumulative.estimate_cost_usd().total_cost_usd(),
             "pricing": "estimated-default",
             "estimated_tokens": usage.estimated_tokens,
         },
@@ -11400,6 +11439,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
+        let _env_guard = env_lock();
+        let _cwd_guard = cwd_guard();
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
@@ -11407,6 +11448,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_allowed_tools_flag() {
+        let _env_guard = env_lock();
+        let _cwd_guard = cwd_guard();
         for raw in ["", ",,"] {
             let error = parse_args(&["--allowedTools".to_string(), raw.to_string()])
                 .expect_err("empty allowedTools should be rejected");

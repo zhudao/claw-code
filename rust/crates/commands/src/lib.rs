@@ -3027,7 +3027,19 @@ fn render_mcp_report_json_for(
             }
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
-        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
+        // #830: `claw mcp show` with no server name is a missing required
+        // argument, not an unknown action. Emit a dedicated error_kind so
+        // machine consumers can distinguish "I know show, but need a name"
+        // from "I don't know this action".
+        Some("show") => Ok(serde_json::json!({
+            "kind": "mcp",
+            "action": "show",
+            "status": "error",
+            "ok": false,
+            "error_kind": "missing_argument",
+            "hint": "Usage: claw mcp show <server>\nRun `claw mcp list` to see available servers.",
+            "message": "missing required argument: mcp show requires a server name.",
+        })),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();

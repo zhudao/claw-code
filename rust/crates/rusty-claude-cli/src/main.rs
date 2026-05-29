@@ -271,7 +271,9 @@ Run `claw --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.starts_with("unknown_slash_command:") {
+    if message.starts_with("missing_argument:") || message.starts_with("missing required argument:") {
+        "missing_argument"
+    } else if message.starts_with("unknown_slash_command:") {
         "unknown_slash_command"
     } else if message.starts_with("command_not_found:") {
         "command_not_found"

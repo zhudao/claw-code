@@ -4054,3 +4054,33 @@ fn resume_safe_interactive_only_hint_includes_resume_suggestion() {
         "/diff hint must suggest --resume (it is resume-safe) (#829): hint={hint:?}"
     );
 }
+
+// #830: claw mcp show (missing server name) must emit missing_argument, not unknown_mcp_action
+#[test]
+fn mcp_show_missing_server_name_emits_missing_argument() {
+    let root = unique_temp_dir("mcp-show-missing-830");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["--output-format", "json", "mcp", "show"], &[]);
+    assert_eq!(output.status.code(), Some(1), "mcp show (no name) should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let j: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("mcp show (no name) must emit JSON (#830)");
+    assert_eq!(
+        j["error_kind"], "missing_argument",
+        "mcp show (no name) must emit missing_argument, not unknown_mcp_action (#830): {j}"
+    );
+    assert_ne!(
+        j["error_kind"], "unknown_mcp_action",
+        "mcp show (no name) must not emit unknown_mcp_action (#830): {j}"
+    );
+    let hint = j["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("claw mcp show") || hint.contains("mcp list"),
+        "mcp show (no name) hint should mention usage (#830): {hint:?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "mcp show (no name) JSON must have empty stderr (#830): {stderr:?}"
+    );
+}

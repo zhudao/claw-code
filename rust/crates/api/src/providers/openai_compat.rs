@@ -586,6 +586,21 @@ impl StreamState {
                 }
             }
 
+            if let Some(delta_extra) = &choice.delta.extra_content {
+                if let Some(delta_sig) = delta_extra
+                    .get("google")
+                    .and_then(|g| g.get("thought_signature"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    for state in self.tool_calls.values_mut() {
+                        if state.thought_signature.is_none() {
+                            state.thought_signature.get_or_insert(delta_sig.to_string());
+                        }
+                    }
+                }
+            }
+
             if let Some(finish_reason) = choice.finish_reason {
                 self.stop_reason = Some(normalize_finish_reason(&finish_reason));
                 if finish_reason == "tool_calls" {
@@ -693,6 +708,7 @@ struct ToolCallState {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    thought_signature: Option<String>,
     emitted_len: usize,
     started: bool,
     stopped: bool,
@@ -709,6 +725,24 @@ impl ToolCallState {
         }
         if let Some(arguments) = tool_call.function.arguments {
             self.arguments.push_str(&arguments);
+        }
+
+        if let Some(sig) = tool_call.thought_signature.filter(|s| !s.is_empty()) {
+            self.thought_signature.get_or_insert(sig);
+        }
+
+        // https://ai.google.dev/gemini-api/docs/thought-signatures
+        if self.thought_signature.is_none() {
+            if let Some(sig) = tool_call
+                .extra_content
+                .as_ref()
+                .and_then(|ec| ec.get("google"))
+                .and_then(|g| g.get("thought_signature"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                self.thought_signature.get_or_insert(sig.to_string());
+            }
         }
     }
 
@@ -731,6 +765,7 @@ impl ToolCallState {
                 id,
                 name,
                 input: json!({}),
+                thought_signature: self.thought_signature.clone(),
             },
         }))
     }
@@ -782,6 +817,10 @@ struct ChatMessage {
 struct ResponseToolCall {
     id: String,
     function: ResponseToolFunction,
+    #[serde(default)]
+    thought_signature: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -852,6 +891,8 @@ struct ChunkDelta {
     thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -860,7 +901,7 @@ struct ThinkingDelta {
     content: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct DeltaToolCall {
     #[serde(default)]
     index: u32,
@@ -868,6 +909,10 @@ struct DeltaToolCall {
     id: Option<String>,
     #[serde(default)]
     function: DeltaFunction,
+    #[serde(default)]
+    thought_signature: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -922,6 +967,22 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     canonical.starts_with("deepseek-v4")
 }
+
+/// Dummy thought signature accepted by Gemini as a validation bypass for
+/// conversation history that lacks a real signature. Source:
+/// - LiteLLM: https://github.com/BerriAI/litellm/pull/16812
+/// - Google: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
+const GEMINI_DUMMY_THOUGHT_SIGNATURE: &str = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
+
+/// Returns true if the model is a Gemini model (Gemini 2.5+, 3+ etc) that
+/// requires `thought_signature` on function calls in conversation history.
+#[must_use]
+pub fn is_gemini_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("gemini")
+}
+
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
@@ -1216,14 +1277,32 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::Thinking {
                         thinking: value, ..
                     } => reasoning.push_str(value),
-                    InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": input.to_string(),
+                    InputContentBlock::ToolUse { id, name, input, thought_signature } => {
+                        let mut tc = json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": input.to_string(),
+                            }
+                        });
+
+                        let sig_for_gemini = thought_signature.clone().or_else(|| {
+                            if is_gemini_model(model) {
+                                Some(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string())
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(sig) = sig_for_gemini {
+                            tc["extra_content"] = json!({
+                                "google": {
+                                    "thought_signature": sig
+                                }
+                            });
                         }
-                    })),
+                        tool_calls.push(tc);
+                    }
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
@@ -1468,10 +1547,22 @@ fn normalize_response(
         content.push(OutputContentBlock::Text { text });
     }
     for tool_call in choice.message.tool_calls {
+        let thought_signature = tool_call.thought_signature.or_else(|| {
+            tool_call
+                .extra_content
+                .as_ref()
+                .and_then(|ec| ec.get("google"))
+                .and_then(|g| g.get("thought_signature"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        });
+
         content.push(OutputContentBlock::ToolUse {
             id: tool_call.id,
             name: tool_call.function.name,
             input: parse_tool_arguments(&tool_call.function.arguments),
+            thought_signature,
         });
     }
 
@@ -1866,6 +1957,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     input: json!({"city": "Paris"}),
+                    thought_signature: None,
                 }],
             }],
             stream: false,
@@ -1943,6 +2035,7 @@ mod tests {
                         reasoning_content: Some("think".to_string()),
                         thinking: None,
                         tool_calls: Vec::new(),
+                        extra_content: None,
                     },
                     finish_reason: None,
                 }],
@@ -1960,6 +2053,7 @@ mod tests {
                             reasoning_content: None,
                             thinking: None,
                             tool_calls: Vec::new(),
+                            extra_content: None,
                         },
                         finish_reason: Some("stop".to_string()),
                     }],
@@ -2504,6 +2598,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "/tmp/test"}),
+                    thought_signature: None,
                 }],
             }],
             stream: false,
@@ -2722,6 +2817,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "/tmp/test"}),
+                        thought_signature: None,
                     }],
                 },
                 InputMessage {

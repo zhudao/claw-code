@@ -10414,7 +10414,7 @@ fn render_last_tool_debug_report(session: &Session) -> Result<String, Box<dyn st
         .rev()
         .find_map(|message| {
             message.blocks.iter().rev().find_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     Some((id.clone(), name.clone(), input.clone()))
                 }
                 _ => None,
@@ -10751,7 +10751,7 @@ fn render_export_text(session: &Session) -> String {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
                 ContentBlock::Thinking { .. } => {}
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
                 ContentBlock::ToolResult {
@@ -10989,7 +10989,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     }
                 }
                 ContentBlock::Thinking { .. } => {}
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
                         short_tool_id(id)
@@ -11872,7 +11872,7 @@ impl AnthropicRuntimeClient {
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
+        let mut pending_tool: Option<(String, String, String, Option<String>)> = None;
         // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
         let mut pending_thinking: Option<(String, Option<String>)> = None;
         let mut block_has_thinking_summary = false;
@@ -11948,7 +11948,7 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
+                        if let Some((_, _, input, _)) = &mut pending_tool {
                             input.push_str(&partial_json);
                         }
                     }
@@ -11983,7 +11983,7 @@ impl AnthropicRuntimeClient {
                             signature,
                         });
                     }
-                    if let Some((id, name, input)) = pending_tool.take() {
+                    if let Some((id, name, input, thought_signature)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
@@ -11991,7 +11991,7 @@ impl AnthropicRuntimeClient {
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::ToolUse { id, name, input });
+                        events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
@@ -12167,7 +12167,7 @@ fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
         .iter()
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some(json!({
+            ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
                 "id": id,
                 "name": name,
                 "input": input,
@@ -12868,7 +12868,7 @@ fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
+    pending_tool: &mut Option<(String, String, String, Option<String>)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
@@ -12882,7 +12882,7 @@ fn push_output_block(
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
-        OutputContentBlock::ToolUse { id, name, input } => {
+        OutputContentBlock::ToolUse { id, name, input, thought_signature } => {
             // During streaming, the initial content_block_start has an empty input ({}).
             // The real input arrives via input_json_delta events. In
             // non-streaming responses, preserve a legitimate empty object.
@@ -12894,7 +12894,7 @@ fn push_output_block(
             } else {
                 input.to_string()
             };
-            *pending_tool = Some((id, name, initial_input));
+            *pending_tool = Some((id, name, initial_input, thought_signature));
         }
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
@@ -12925,8 +12925,8 @@ fn response_to_events(
             false,
             &mut block_has_thinking_summary,
         )?;
-        if let Some((id, name, input)) = pending_tool.take() {
-            events.push(AssistantEvent::ToolUse { id, name, input });
+        if let Some((id, name, input, thought_signature)) = pending_tool.take() {
+            events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
         }
     }
 
@@ -13130,11 +13130,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                             signature: signature.clone(),
                         })
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input, thought_signature, .. } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                        thought_signature: thought_signature.clone(),
                     }),
                     ContentBlock::ToolResult {
                         tool_use_id,
@@ -15728,6 +15729,7 @@ mod tests {
                     id: "toolu_abcdefghijklmnop".to_string(),
                     name: "bash".to_string(),
                     input: r#"{"command":"ls -la"}"#.to_string(),
+                    thought_signature: None,
                 },
             ]),
             ConversationMessage {
@@ -17669,6 +17671,7 @@ UU conflicted.rs",
                 id: "tool-1".to_string(),
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -18059,6 +18062,7 @@ UU conflicted.rs",
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({}),
+                thought_signature: None,
             },
             &mut out,
             &mut events,
@@ -18071,7 +18075,7 @@ UU conflicted.rs",
         assert!(events.is_empty());
         assert_eq!(
             pending_tool,
-            Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
+            Some(("tool-1".to_string(), "read_file".to_string(), String::new(), None))
         );
     }
 
@@ -18088,6 +18092,7 @@ UU conflicted.rs",
                     id: "tool-1".to_string(),
                     name: "read_file".to_string(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 stop_reason: Some("tool_use".to_string()),
                 stop_sequence: None,
@@ -18123,6 +18128,7 @@ UU conflicted.rs",
                     id: "tool-2".to_string(),
                     name: "read_file".to_string(),
                     input: json!({ "path": "rust/Cargo.toml" }),
+                    thought_signature: None,
                 }],
                 stop_reason: Some("tool_use".to_string()),
                 stop_sequence: None,

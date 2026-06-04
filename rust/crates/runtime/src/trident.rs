@@ -686,6 +686,7 @@ mod tests {
                 id: "1".to_string(),
                 name: "read_file".to_string(),
                 input: r#"{"path":"src/main.rs"}"#.to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage::tool_result(
                 "1",
@@ -697,6 +698,7 @@ mod tests {
                 id: "2".to_string(),
                 name: "edit_file".to_string(),
                 input: r#"{"path":"src/main.rs","old":"old","new":"new"}"#.to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage::tool_result(
                 "2",
@@ -718,6 +720,7 @@ mod tests {
                 id: "1".to_string(),
                 name: "read_file".to_string(),
                 input: r#"{"path":"src/main.rs"}"#.to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage::tool_result(
                 "1",
@@ -746,6 +749,7 @@ mod tests {
                 id: "t".to_string(),
                 name: "bash".to_string(),
                 input: r#"{"command":"ls"}"#.to_string(),
+                thought_signature: None,
             },
         ]));
 
@@ -764,6 +768,7 @@ mod tests {
                     id: format!("read_{i}"),
                     name: "read_file".to_string(),
                     input: format!(r#"{{"path":"src/{i}.rs"}}"#),
+                    thought_signature: None,
                 },
             ]));
             messages.push(ConversationMessage::tool_result(
@@ -789,6 +794,7 @@ mod tests {
                 id: "1".to_string(),
                 name: "read_file".to_string(),
                 input: r#"{"path":"src/main.rs"}"#.to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage::tool_result(
                 "1",
@@ -800,6 +806,7 @@ mod tests {
                 id: "2".to_string(),
                 name: "edit_file".to_string(),
                 input: r#"{"path":"src/main.rs","old":"buggy","new":"fixed"}"#.to_string(),
+                thought_signature: None,
             }]),
             ConversationMessage::tool_result(
                 "2",

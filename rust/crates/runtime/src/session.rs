@@ -42,6 +42,7 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: String,
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -817,7 +818,7 @@ impl ContentBlock {
                     );
                 }
             }
-            Self::ToolUse { id, name, input } => {
+            Self::ToolUse { id, name, input, thought_signature } => {
                 object.insert(
                     "type".to_string(),
                     JsonValue::String("tool_use".to_string()),
@@ -825,6 +826,12 @@ impl ContentBlock {
                 object.insert("id".to_string(), JsonValue::String(id.clone()));
                 object.insert("name".to_string(), JsonValue::String(name.clone()));
                 object.insert("input".to_string(), JsonValue::String(input.clone()));
+                if let Some(sig) = thought_signature {
+                    object.insert(
+                        "thought_signature".to_string(),
+                        JsonValue::String(sig.clone()),
+                    );
+                }
             }
             Self::ToolResult {
                 tool_use_id,
@@ -874,6 +881,7 @@ impl ContentBlock {
                 id: required_string(object, "id")?,
                 name: required_string(object, "name")?,
                 input: required_string(object, "input")?,
+                thought_signature: object.get("thought_signature").and_then(JsonValue::as_str).map(String::from)
             }),
             "tool_result" => Ok(Self::ToolResult {
                 tool_use_id: required_string(object, "tool_use_id")?,
@@ -1069,7 +1077,7 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
                 );
             }
         }
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse { id, name, input, thought_signature } => {
             object.insert(
                 "type".to_string(),
                 JsonValue::String("tool_use".to_string()),
@@ -1083,6 +1091,12 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
                 "input".to_string(),
                 JsonValue::String(sanitize_jsonl_field(input)),
             );
+            if let Some(sig) = thought_signature {
+                object.insert(
+                    "thought_signature".to_string(),
+                    JsonValue::String(sanitize_jsonl_field(sig)),
+                );
+            }
         }
         ContentBlock::ToolResult {
             tool_use_id,
@@ -1433,6 +1447,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "bash".to_string(),
                         input: "echo hi".to_string(),
+                        thought_signature: None,
                     },
                 ],
                 Some(TokenUsage {
@@ -1596,6 +1611,7 @@ mod tests {
                     id: "tool-1".to_string(),
                     name: "bash".to_string(),
                     input: format!("Authorization: Bearer {secret}"),
+                    thought_signature: None,
                 },
             ]))
             .expect("tool use should append");

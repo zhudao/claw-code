@@ -8106,6 +8106,7 @@ mod tests {
                 "tool-1".to_string(),
                 "read_file".to_string(),
                 "{\"path\":\"src/main.rs\"}".to_string(),
+                None,
             ))
         );
         assert_eq!(
@@ -8114,6 +8115,7 @@ mod tests {
                 "tool-2".to_string(),
                 "grep_search".to_string(),
                 "{\"pattern\":\"TODO\"}".to_string(),
+                None,
             ))
         );
     }

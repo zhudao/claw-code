@@ -2939,6 +2939,10 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             err_msg.push_str("\nDid you mean `openai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
+        } else if trimmed.starts_with("qwen") && trimmed.contains(':') {
+            err_msg.push_str("\nFor a local Ollama model, set `OPENAI_BASE_URL=http://127.0.0.1:11434/v1` before using tagged names like `");
+            err_msg.push_str(trimmed);
+            err_msg.push_str("`.");
         } else if trimmed.starts_with("qwen") {
             err_msg.push_str("\nDid you mean `qwen/");
             err_msg.push_str(trimmed);
@@ -13737,8 +13741,15 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            events.push(AssistantEvent::Thinking {
+                thinking,
+                signature,
+            });
             *block_has_thinking_summary = true;
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -19073,6 +19084,13 @@ UU conflicted.rs",
 
         assert!(matches!(
             &events[0],
+            AssistantEvent::Thinking {
+                thinking,
+                signature
+            } if thinking == "step 1" && signature.as_deref() == Some("sig_123")
+        ));
+        assert!(matches!(
+            &events[1],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");
@@ -19649,6 +19667,41 @@ mod dump_manifests_tests {
 
 #[cfg(test)]
 mod alias_resolution_tests {
+    fn ollama_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("ollama env lock poisoned")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     use super::{resolve_model_alias_with_config, validate_model_syntax};
 
     #[test]
@@ -19670,6 +19723,8 @@ mod alias_resolution_tests {
 
     #[test]
     fn test_alias_resolution_syntax_validation() {
+        let _guard = ollama_env_lock();
+        let _env = EnvVarGuard::unset("OLLAMA_HOST");
         // Resolved aliases should pass syntax validation
         let resolved = resolve_model_alias_with_config("opus");
         assert!(validate_model_syntax(&resolved).is_ok());
@@ -19680,6 +19735,8 @@ mod alias_resolution_tests {
 
     #[test]
     fn test_unknown_alias_fails_validation() {
+        let _guard = ollama_env_lock();
+        let _env = EnvVarGuard::unset("OLLAMA_HOST");
         // Unknown aliases resolve to themselves
         let resolved = resolve_model_alias_with_config("unknown-alias");
         assert_eq!(resolved, "unknown-alias");
@@ -19691,6 +19748,28 @@ mod alias_resolution_tests {
     }
 
     #[test]
+    fn qwen_invalid_model_hint_mentions_local_ollama_openai_base_url() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        let _openai_env = EnvVarGuard::unset("OPENAI_BASE_URL");
+        let result = validate_model_syntax("qwen3:8b");
+
+        let error = result.expect_err("Ollama tag without local base URL should fail");
+        assert!(
+            error.contains("Ollama"),
+            "Qwen Ollama tag error should mention Ollama: {error}"
+        );
+        assert!(
+            error.contains("OPENAI_BASE_URL"),
+            "Qwen Ollama tag error should mention OPENAI_BASE_URL: {error}"
+        );
+        assert!(
+            error.contains("http://127.0.0.1:11434/v1"),
+            "Qwen Ollama tag error should show local Ollama OpenAI URL: {error}"
+        );
+    }
+
+    #[test]
     fn test_direct_provider_model_passes() {
         // Direct provider/model strings should remain unchanged and pass
         let model = "openai/gpt-4o";
@@ -19699,14 +19778,13 @@ mod alias_resolution_tests {
     }
     #[test]
     fn test_ollama_host_bypasses_model_validation() {
-        // Safety: test sets and clears env var within the test.
-        std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:11434");
+        let _guard = ollama_env_lock();
+        let _env = EnvVarGuard::set("OLLAMA_HOST", "http://127.0.0.1:11434");
         // Ollama model names with colons pass
         assert!(validate_model_syntax("qwen3:8b").is_ok());
         assert!(validate_model_syntax("gemma4:e2b").is_ok());
         assert!(validate_model_syntax("qwen3.6:27b-nvfp4").is_ok());
         // Empty model still rejected
         assert!(validate_model_syntax("").is_err());
-        std::env::remove_var("OLLAMA_HOST");
     }
 }

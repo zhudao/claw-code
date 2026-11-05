@@ -149,6 +149,48 @@ curl -sS "$OPENAI_BASE_URL/models" \
 
 For local configuration, see your gateway's documentation for the correct base URL, API key format, and available model IDs. The same OPENAI_BASE_URL + OPENAI_API_KEY pattern applies to any OpenAI-compatible remote gateway.
 
+## LLMTR
+
+[LLMTR](https://llmtr.com) is an OpenAI-compatible gateway. Use the same client: set `OPENAI_BASE_URL` to `https://llmtr.com/v1` and `OPENAI_API_KEY` to a bearer key (`llmtr-...`).
+
+```bash
+export OPENAI_BASE_URL="https://llmtr.com/v1"
+export OPENAI_API_KEY="llmtr-..."
+claw --model "local/llmtr/qwen3-8-27b" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Send the catalog id unchanged. `llmtr/qwen3-8-27b` already starts with the gateway name, so that prefix stays on the wire. The `local/` hatch only selects the OpenAI-compatible transport and is removed before the request. A bare `qwen/` or `qwen-` name is a DashScope route and will not reach LLMTR, so vendor-prefixed ids need the same hatch: `local/<vendor>/<model>`.
+
+Claw asks for up to 64,000 output tokens on these routes. LLMTR rejects a request whose `max_tokens` is above the model's output limit, so pick a model that allows at least that much. `llmtr/qwen3-8-27b` allows 262,144. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://llmtr.com/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.top_provider.max_completion_tokens)"'
+```
+
+## UberLLM
+
+[UberLLM](https://uberllm.dev) is a pay-as-you-go OpenAI-compatible gateway (prepaid, no free tier). Set `OPENAI_BASE_URL` to `https://api.uberllm.dev/v1` and `OPENAI_API_KEY` to a bearer key (`ull_...`).
+
+```bash
+export OPENAI_BASE_URL="https://api.uberllm.dev/v1"
+export OPENAI_API_KEY="ull_..."
+claw --model "local/deepseek/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+UberLLM ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `moonshotai/kimi-k2.6`, `qwen/qwen3.8-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Some prefixes would otherwise pick a native route; a bare `qwen/qwen3.8-flash`, for example, goes to DashScope and asks for `DASHSCOPE_API_KEY`.
+
+Claw asks for up to 64,000 output tokens on these routes. UberLLM does not reject that on a model with a smaller output limit (for example `aion-labs/aion-3-0-mini`, 32,768); the answer is simply bounded by the model's limit, listed as `max_output_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.uberllm.dev/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
+```
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.

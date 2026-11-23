@@ -666,13 +666,21 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
-    if old_string == new_string {
+    // read_file and grep_search return lines joined with `\n`, so text quoted
+    // from a CRLF file arrives without its `\r`. Match the file's line endings
+    // so multi-line edits apply and inserted lines stay CRLF.
+    let (target, replacement) = if uses_crlf_line_endings(&original_file) {
+        (to_crlf(old_string), to_crlf(new_string))
+    } else {
+        (old_string.to_owned(), new_string.to_owned())
+    };
+    if target == replacement {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    if !original_file.contains(&target) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "old_string not found in file",
@@ -680,9 +688,9 @@ pub fn edit_file(
     }
 
     let updated = if replace_all {
-        original_file.replace(old_string, new_string)
+        original_file.replace(&target, &replacement)
     } else {
-        original_file.replacen(old_string, new_string, 1)
+        original_file.replacen(&target, &replacement, 1)
     };
     fs::write(&absolute_path, &updated)?;
 
@@ -696,6 +704,16 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Whether the text has line breaks and every one of them is `\r\n`.
+fn uses_crlf_line_endings(text: &str) -> bool {
+    let line_feeds = text.matches('\n').count();
+    line_feeds > 0 && text.matches("\r\n").count() == line_feeds
+}
+
+fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -950,8 +968,13 @@ fn normalize_for_comparison(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Whether a directory below the search root is one of the heavy
+/// directories (VCS data, dependencies, build output) that glob and grep
+/// searches skip. The root itself is always searched, so a search the caller
+/// points into one of these directories still works.
 fn should_skip_glob_dir(entry: &DirEntry) -> bool {
-    entry.file_type().is_dir()
+    entry.depth() > 0
+        && entry.file_type().is_dir()
         && entry
             .file_name()
             .to_str()
@@ -989,7 +1012,10 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_glob_dir(entry))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -1241,6 +1267,57 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn edits_crlf_file_with_lines_copied_from_read_file() {
+        let path = temp_path("edit-crlf.rs");
+        std::fs::write(&path, "fn main() {\r\n    println!(\"hi\");\r\n}\r\n")
+            .expect("initial write should succeed");
+        let path_str = path.to_string_lossy();
+
+        // read_file returns the lines joined with `\n`, so a block quoted from
+        // its output does not contain the file's `\r\n` line endings.
+        let read = read_file(path_str.as_ref(), None, None).expect("read should succeed");
+        let old_string = read
+            .file
+            .content
+            .lines()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(old_string, "fn main() {\n    println!(\"hi\");");
+
+        edit_file(
+            path_str.as_ref(),
+            &old_string,
+            "fn main() {\n    println!(\"hello\");\n    println!(\"world\");",
+            false,
+        )
+        .expect("edit should match the CRLF lines");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back should succeed"),
+            "fn main() {\r\n    println!(\"hello\");\r\n    println!(\"world\");\r\n}\r\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edit_keeps_line_endings_of_lf_and_mixed_files() {
+        let path = temp_path("edit-lf.txt");
+        std::fs::write(&path, "one\ntwo\r\nthree\n").expect("initial write should succeed");
+        edit_file(
+            path.to_string_lossy().as_ref(),
+            "one\n",
+            "uno\nwon\n",
+            false,
+        )
+        .expect("edit should succeed");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back should succeed"),
+            "uno\nwon\ntwo\r\nthree\n"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1566,6 +1643,50 @@ mod tests {
     }
 
     #[test]
+    fn grep_search_skips_common_heavy_directories() {
+        let dir = temp_path("grep-ignored-dirs");
+        for sub in ["src", ".git/refs", "node_modules/pkg", "target/debug/build"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("notes.txt"), "needle").unwrap();
+        }
+        let grep = |path: PathBuf| {
+            grep_search(&GrepSearchInput {
+                pattern: String::from("needle"),
+                path: Some(path.to_string_lossy().into_owned()),
+                glob: None,
+                output_mode: Some(String::from("files_with_matches")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: None,
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            })
+            .expect("grep should succeed")
+            .filenames
+        };
+
+        let filenames = grep(dir.clone());
+        assert_eq!(
+            filenames.len(),
+            1,
+            "ignored dirs should be pruned: {filenames:?}"
+        );
+        assert!(Path::new(&filenames[0]).ends_with("src/notes.txt"));
+
+        // A search rooted inside an ignored directory still searches it.
+        let filenames = grep(dir.join("node_modules"));
+        assert_eq!(filenames.len(), 1, "{filenames:?}");
+        assert!(Path::new(&filenames[0]).ends_with("node_modules/pkg/notes.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn expand_braces_no_braces() {
         assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
     }
@@ -1645,6 +1766,12 @@ mod tests {
             .any(|path| path.contains("node_modules")
                 || path.contains(".build")
                 || path.contains("/target/")));
+
+        // A glob rooted inside an ignored directory still searches it.
+        let inside = dir.join("node_modules");
+        let result = glob_search("**/AGENTS.md", Some(inside.to_str().unwrap()))
+            .expect("glob should succeed");
+        assert_eq!(result.num_files, 1, "{:?}", result.filenames);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
